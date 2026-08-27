@@ -15,6 +15,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 16) {
                 controls
                 status
+                detailPane
                 resultsTable
             }
             .padding()
@@ -40,15 +41,13 @@ struct ContentView: View {
                 DatePicker("DateTo", selection: $viewModel.dateTo, displayedComponents: .date)
             }
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Membership Filters")
-                    .font(.headline)
-
-                ForEach(MembershipGroup.allCases) { group in
-                    Toggle(isOn: binding(for: group)) {
-                        Text(group.title)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(MembershipGroup.allCases) { group in
+                        Toggle(group.title, isOn: binding(for: group))
+                            .toggleStyle(.button)
+                            .font(.caption)
                     }
-                    .toggleStyle(.switch)
                 }
             }
         }
@@ -79,6 +78,52 @@ struct ContentView: View {
         .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
+    @ViewBuilder
+    private var detailPane: some View {
+        if let selectedRow = viewModel.selectedRow {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text(selectedRow.symbol)
+                        .font(.headline)
+                        .fontDesign(.monospaced)
+                    Text(selectedRow.name)
+                        .foregroundStyle(.secondary)
+                }
+
+                if viewModel.isLoadingPerformance {
+                    ProgressView("Loading price metrics...")
+                } else if let errorMessage = viewModel.performanceErrorMessage {
+                    Text(errorMessage)
+                        .foregroundStyle(.red)
+                } else if let performance = viewModel.selectedPerformance {
+                    Text("Current Price: \(String(format: "%.2f", performance.currentPrice))")
+                        .font(.subheadline)
+
+                    LazyVGrid(columns: [
+                        GridItem(.adaptive(minimum: 92), spacing: 8)
+                    ], spacing: 8) {
+                        ForEach(performance.metrics) { metric in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(metric.label)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(metric.displayValue)
+                                    .font(.subheadline)
+                                    .fontWeight(.semibold)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                            .background(Color(uiColor: .systemBackground))
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                        }
+                    }
+                }
+            }
+            .padding(12)
+            .background(Color(uiColor: .systemGray6))
+        }
+    }
+
     private var tableHeader: some View {
         HStack(spacing: 0) {
             headerCell("Report Date", width: 120)
@@ -99,7 +144,13 @@ struct ContentView: View {
             bodyCell(row.name, width: 320)
         }
         .padding(.vertical, 10)
-        .background(Color(uiColor: .secondarySystemBackground))
+        .background(row.id == viewModel.selectedRow?.id ? Color(uiColor: .systemGray5) : Color(uiColor: .secondarySystemBackground))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            Task {
+                await viewModel.select(row)
+            }
+        }
     }
 
     private func headerCell(_ title: String, width: CGFloat) -> some View {
