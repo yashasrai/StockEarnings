@@ -9,14 +9,54 @@ import Foundation
 import SwiftUI
 import Combine
 
+enum MembershipGroup: String, CaseIterable, Identifiable {
+    case sp100 = "S&P100"
+    case russell1000 = "arrRussel1000Stocks"
+    case russell2000 = "Russel2000"
+    case occTop500 = "OCCNormalizedTop500"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .sp100:
+            return "S&P100"
+        case .russell1000:
+            return "Russell 1000"
+        case .russell2000:
+            return "Russell 2000"
+        case .occTop500:
+            return "OCC Top 500"
+        }
+    }
+}
+
 struct EarningsRow: Identifiable, Hashable {
     let index: String
     let reportDate: String
     let symbol: String
     let name: String
     let estimate: String
+    let timeOfTheDay: String
 
     var id: String { "\(reportDate)|\(symbol)|\(index)" }
+
+    var membershipSet: Set<String> {
+        Set(index.split(separator: ",").map(String.init))
+    }
+
+    var displayTimeOfTheDay: String {
+        switch timeOfTheDay.lowercased() {
+        case "bmo":
+            return "Before Open"
+        case "amc":
+            return "After Close"
+        case let value where value.isEmpty:
+            return "Unknown"
+        default:
+            return timeOfTheDay
+        }
+    }
 }
 
 enum EarningsError: LocalizedError {
@@ -134,7 +174,8 @@ struct EarningsService {
                     reportDate: reportDate,
                     symbol: sourceRow["symbol", default: ""],
                     name: sourceRow["name", default: ""],
-                    estimate: sourceRow["estimate", default: ""]
+                    estimate: sourceRow["estimate", default: ""],
+                    timeOfTheDay: sourceRow["timeOfTheDay", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
                 ),
                 membershipCount: matchedMemberships.count
             ))
@@ -232,18 +273,20 @@ struct EarningsService {
 final class EarningsViewModel: ObservableObject {
     @Published var dateFrom: Date
     @Published var dateTo: Date
+    @Published var enabledGroups = Set(MembershipGroup.allCases)
     @Published private(set) var rows: [EarningsRow] = []
     @Published private(set) var isLoading = false
     @Published private(set) var errorMessage: String?
 
     private let service: EarningsService
     private var hasLoaded = false
+    var hasFinishedInitialLoad: Bool { hasLoaded }
 
     init(service: EarningsService = EarningsService(), calendar: Calendar = .current) {
         self.service = service
-        let currentYear = calendar.component(.year, from: Date())
-        self.dateFrom = calendar.date(from: DateComponents(year: currentYear, month: 8, day: 26)) ?? Date()
-        self.dateTo = calendar.date(from: DateComponents(year: currentYear, month: 9, day: 5)) ?? Date()
+        let today = calendar.startOfDay(for: Date())
+        self.dateFrom = calendar.date(byAdding: .day, value: -1, to: today) ?? today
+        self.dateTo = Self.currentWeekSaturday(from: today, calendar: calendar) ?? today
     }
 
     func loadIfNeeded() async {
@@ -264,5 +307,29 @@ final class EarningsViewModel: ObservableObject {
         }
 
         isLoading = false
+    }
+
+    func toggle(_ group: MembershipGroup) {
+        if enabledGroups.contains(group) {
+            enabledGroups.remove(group)
+        } else {
+            enabledGroups.insert(group)
+        }
+    }
+
+    var filteredRows: [EarningsRow] {
+        guard !enabledGroups.isEmpty else {
+            return []
+        }
+
+        let selectedMemberships = Set(enabledGroups.map(\.rawValue))
+        return rows.filter { !$0.membershipSet.isDisjoint(with: selectedMemberships) }
+    }
+
+    private static func currentWeekSaturday(from today: Date, calendar: Calendar) -> Date? {
+        let weekday = calendar.component(.weekday, from: today)
+        let saturdayWeekday = 7
+        let daysUntilSaturday = (saturdayWeekday - weekday + 7) % 7
+        return calendar.date(byAdding: .day, value: daysUntilSaturday, to: today)
     }
 }

@@ -23,6 +23,14 @@ struct ContentView: View {
         .task {
             await viewModel.loadIfNeeded()
         }
+        .task(id: viewModel.dateFrom) {
+            guard viewModel.hasFinishedInitialLoad else { return }
+            await viewModel.load()
+        }
+        .task(id: viewModel.dateTo) {
+            guard viewModel.hasFinishedInitialLoad else { return }
+            await viewModel.load()
+        }
     }
 
     private var controls: some View {
@@ -32,21 +40,17 @@ struct ContentView: View {
                 DatePicker("DateTo", selection: $viewModel.dateTo, displayedComponents: .date)
             }
 
-            Button {
-                Task {
-                    await viewModel.load()
-                }
-            } label: {
-                if viewModel.isLoading {
-                    ProgressView()
-                        .frame(maxWidth: .infinity)
-                } else {
-                    Text("Fetch Earnings")
-                        .frame(maxWidth: .infinity)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Membership Filters")
+                    .font(.headline)
+
+                ForEach(MembershipGroup.allCases) { group in
+                    Toggle(isOn: binding(for: group)) {
+                        Text(group.title)
+                    }
+                    .toggleStyle(.switch)
                 }
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(viewModel.isLoading)
         }
     }
 
@@ -56,7 +60,7 @@ struct ContentView: View {
             Text(errorMessage)
                 .foregroundStyle(.red)
         } else {
-            Text("\(viewModel.rows.count) rows")
+            Text("\(viewModel.filteredRows.count) rows")
                 .foregroundStyle(.secondary)
         }
     }
@@ -65,7 +69,7 @@ struct ContentView: View {
         ScrollView([.horizontal, .vertical]) {
             LazyVStack(alignment: .leading, spacing: 0) {
                 tableHeader
-                ForEach(viewModel.rows) { row in
+                ForEach(viewModel.filteredRows) { row in
                     tableRow(row)
                     Divider()
                 }
@@ -78,10 +82,9 @@ struct ContentView: View {
     private var tableHeader: some View {
         HStack(spacing: 0) {
             headerCell("Report Date", width: 120)
+            headerCell("Timing", width: 120)
             headerCell("Symbol", width: 90)
-            headerCell("Name", width: 260)
-            headerCell("Estimate", width: 110)
-            headerCell("Index", width: 260)
+            headerCell("Name", width: 320)
         }
         .font(.headline)
         .padding(.vertical, 10)
@@ -91,10 +94,9 @@ struct ContentView: View {
     private func tableRow(_ row: EarningsRow) -> some View {
         HStack(spacing: 0) {
             bodyCell(row.reportDate, width: 120)
+            bodyCell(row.displayTimeOfTheDay, width: 120)
             bodyCell(row.symbol, width: 90, monospaced: true)
-            bodyCell(row.name, width: 260)
-            bodyCell(row.estimate, width: 110)
-            bodyCell(row.index, width: 260)
+            bodyCell(row.name, width: 320)
         }
         .padding(.vertical, 10)
         .background(Color(uiColor: .secondarySystemBackground))
@@ -117,6 +119,13 @@ struct ContentView: View {
         }
         .frame(width: width, alignment: .leading)
         .padding(.horizontal, 12)
+    }
+
+    private func binding(for group: MembershipGroup) -> Binding<Bool> {
+        Binding(
+            get: { viewModel.enabledGroups.contains(group) },
+            set: { _ in viewModel.toggle(group) }
+        )
     }
 }
 
