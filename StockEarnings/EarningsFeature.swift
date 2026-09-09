@@ -59,18 +59,74 @@ struct EarningsRow: Identifiable, Hashable {
     }
 }
 
-struct StockPerformanceMetric: Identifiable, Hashable {
-    let label: String
-    let value: Double
+enum StockLookback: String, CaseIterable, Identifiable {
+    case oneDay = "1d"
+    case twoDays = "2d"
+    case threeDays = "3d"
+    case oneWeek = "1w"
+    case twoWeeks = "2w"
+    case oneMonth = "1m"
+    case threeMonths = "3m"
+    case sixMonths = "6m"
+    case oneYear = "1y"
+    case twoYears = "2y"
 
-    var id: String { label }
-    var displayValue: String { String(format: "%.2f%%", value) }
+    var id: String { rawValue }
+
+    var offset: DateComponents {
+        switch self {
+        case .oneDay: return DateComponents(day: -1)
+        case .twoDays: return DateComponents(day: -2)
+        case .threeDays: return DateComponents(day: -3)
+        case .oneWeek: return DateComponents(day: -7)
+        case .twoWeeks: return DateComponents(day: -14)
+        case .oneMonth: return DateComponents(month: -1)
+        case .threeMonths: return DateComponents(month: -3)
+        case .sixMonths: return DateComponents(month: -6)
+        case .oneYear: return DateComponents(year: -1)
+        case .twoYears: return DateComponents(year: -2)
+        }
+    }
+}
+
+struct StockPricePoint: Hashable {
+    let date: Date
+    let close: Double
 }
 
 struct StockPerformanceSnapshot: Hashable {
     let symbol: String
     let currentPrice: Double
-    let metrics: [StockPerformanceMetric]
+    let anchorDate: Date
+    let prices: [StockPricePoint]
+
+    private var calendar: Calendar { Calendar(identifier: .gregorian) }
+
+    func relativePrice(period: StockLookback) -> Double? {
+        guard let startDate = calendar.date(byAdding: period.offset, to: anchorDate) else {
+            return nil
+        }
+        let windowPrices = prices.filter {
+            let day = calendar.startOfDay(for: $0.date)
+            return day >= startDate && day <= anchorDate
+        }
+        guard let minPrice = windowPrices.map(\.close).min(),
+              let maxPrice = windowPrices.map(\.close).max(),
+              maxPrice > minPrice else {
+            return nil
+        }
+        return 100 * ((currentPrice - minPrice) / (maxPrice - minPrice))
+    }
+
+    func gainPercent(period: StockLookback) -> Double? {
+        guard let targetDate = calendar.date(byAdding: period.offset, to: anchorDate),
+              let historicalPrice = prices.last(where: {
+                  calendar.startOfDay(for: $0.date) <= targetDate
+              })?.close else {
+            return nil
+        }
+        return ((currentPrice - historicalPrice) / currentPrice) * 100
+    }
 }
 
 enum EarningsError: LocalizedError {
@@ -326,9 +382,9 @@ struct StockPriceService {
             throw StockPriceError.unavailable
         }
 
-        let prices: [(date: Date, close: Double)] = zip(timestamps, closes).compactMap { timestamp, close in
+        let prices: [StockPricePoint] = zip(timestamps, closes).compactMap { timestamp, close in
             guard let close else { return nil }
-            return (Date(timeIntervalSince1970: TimeInterval(timestamp)), close)
+            return StockPricePoint(date: Date(timeIntervalSince1970: TimeInterval(timestamp)), close: close)
         }
         .sorted { $0.date < $1.date }
 
@@ -345,70 +401,12 @@ struct StockPriceService {
             Date(timeIntervalSince1970: TimeInterval($0))
         } ?? Date())
 
-        let metricDefinitions: [(String, DateComponents)] = [
-            ("1D", DateComponents(day: -1)),
-            ("2D", DateComponents(day: -2)),
-            ("3D", DateComponents(day: -3)),
-            ("1W", DateComponents(day: -7)),
-            ("1M", DateComponents(month: -1)),
-            ("1Y", DateComponents(year: -1)),
-            ("2Y", DateComponents(year: -2)),
-        ]
-
-        let metrics = metricDefinitions.compactMap { label, offset -> StockPerformanceMetric? in
-            guard
-                let targetDate = calendar.date(byAdding: offset, to: anchorDate),
-                let historicalPrice = historicalPrice(onOrBefore: targetDate, from: prices)
-            else {
-                return nil
-            }
-
-            let gain = ((currentPrice - historicalPrice) / currentPrice) * 100
-            return StockPerformanceMetric(label: label, value: gain)
-        }
-
-        let relativeMetricDefinitions: [(String, DateComponents)] = [
-            ("1YRelative", DateComponents(year: -1)),
-            ("6MRelative", DateComponents(month: -6)),
-            ("3MRelative", DateComponents(month: -3)),
-            ("1MRelative", DateComponents(month: -1)),
-        ]
-
-        let relativeMetrics = relativeMetricDefinitions.compactMap { label, offset -> StockPerformanceMetric? in
-            guard
-                let startDate = calendar.date(byAdding: offset, to: anchorDate),
-                let windowPrices = pricesInRange(startingAt: startDate, endingAt: anchorDate, from: prices),
-                let minPrice = windowPrices.map(\.close).min(),
-                let maxPrice = windowPrices.map(\.close).max(),
-                maxPrice > minPrice
-            else {
-                return nil
-            }
-
-            let relative = 100 * ((currentPrice - minPrice) / (maxPrice - minPrice))
-            return StockPerformanceMetric(label: label, value: relative)
-        }
-
-        return StockPerformanceSnapshot(symbol: symbol, currentPrice: currentPrice, metrics: metrics + relativeMetrics)
-    }
-
-    private func historicalPrice(onOrBefore targetDate: Date, from prices: [(date: Date, close: Double)]) -> Double? {
-        let normalizedTarget = calendar.startOfDay(for: targetDate)
-        return prices.last(where: { calendar.startOfDay(for: $0.date) <= normalizedTarget })?.close
-    }
-
-    private func pricesInRange(
-        startingAt startDate: Date,
-        endingAt endDate: Date,
-        from prices: [(date: Date, close: Double)]
-    ) -> [(date: Date, close: Double)]? {
-        let normalizedStart = calendar.startOfDay(for: startDate)
-        let normalizedEnd = calendar.startOfDay(for: endDate)
-        let filtered = prices.filter {
-            let date = calendar.startOfDay(for: $0.date)
-            return date >= normalizedStart && date <= normalizedEnd
-        }
-        return filtered.isEmpty ? nil : filtered
+        return StockPerformanceSnapshot(
+            symbol: symbol,
+            currentPrice: currentPrice,
+            anchorDate: anchorDate,
+            prices: prices
+        )
     }
 }
 

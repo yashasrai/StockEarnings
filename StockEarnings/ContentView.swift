@@ -9,6 +9,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var viewModel = EarningsViewModel()
+    @State private var selectedPeriod: StockLookback = .oneMonth
 
     var body: some View {
         NavigationStack {
@@ -99,29 +100,43 @@ struct ContentView: View {
                     Text("Current Price: \(String(format: "%.2f", performance.currentPrice))")
                         .font(.subheadline)
 
-                    LazyVGrid(columns: [
-                        GridItem(.adaptive(minimum: 92), spacing: 8)
-                    ], spacing: 8) {
-                        ForEach(performance.metrics) { metric in
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(metric.label)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text(metric.displayValue)
-                                    .font(.subheadline)
-                                    .fontWeight(.semibold)
+                    HStack {
+                        Picker("Lookback period", selection: $selectedPeriod) {
+                            ForEach(StockLookback.allCases) { period in
+                                Text(period.rawValue).tag(period)
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(10)
-                            .background(Color(uiColor: .systemBackground))
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
                         }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                    }
+
+                    HStack(alignment: .top, spacing: 16) {
+                        metricResult(
+                            "\(selectedPeriod.rawValue) relative price",
+                            value: performance.relativePrice(period: selectedPeriod)
+                        )
+                        metricResult(
+                            "\(selectedPeriod.rawValue) gain",
+                            value: performance.gainPercent(period: selectedPeriod)
+                        )
                     }
                 }
             }
             .padding(12)
             .background(Color(uiColor: .systemGray6))
         }
+    }
+
+    private func metricResult(_ title: String, value: Double?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value.map { String(format: "%.2f%%", $0) } ?? "N/A")
+                .font(.subheadline.weight(.semibold))
+                .monospacedDigit()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var tableHeader: some View {
