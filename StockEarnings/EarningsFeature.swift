@@ -73,7 +73,36 @@ enum StockLookback: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    var offset: DateComponents {
+    func startDate(before anchorDate: Date, calendar: Calendar) -> Date? {
+        let anchor = calendar.startOfDay(for: anchorDate)
+        switch self {
+        case .oneDay, .twoDays, .threeDays:
+            var remainingDays = -(offset.day ?? 0)
+            var date = anchor
+            while remainingDays > 0 {
+                guard let previousDay = calendar.date(byAdding: .day, value: -1, to: date) else {
+                    return nil
+                }
+                date = previousDay
+                let weekday = calendar.component(.weekday, from: date)
+                if weekday != 1 && weekday != 7 {
+                    remainingDays -= 1
+                }
+            }
+            return date
+        default:
+            guard let date = calendar.date(byAdding: offset, to: anchor) else {
+                return nil
+            }
+            switch calendar.component(.weekday, from: date) {
+            case 7: return calendar.date(byAdding: .day, value: -1, to: date)
+            case 1: return calendar.date(byAdding: .day, value: 1, to: date)
+            default: return date
+            }
+        }
+    }
+
+    private var offset: DateComponents {
         switch self {
         case .oneDay: return DateComponents(day: -1)
         case .twoDays: return DateComponents(day: -2)
@@ -103,7 +132,7 @@ struct StockPerformanceSnapshot: Hashable {
     private var calendar: Calendar { Calendar(identifier: .gregorian) }
 
     func relativePrice(period: StockLookback) -> Double? {
-        guard let startDate = calendar.date(byAdding: period.offset, to: anchorDate) else {
+        guard let startDate = period.startDate(before: anchorDate, calendar: calendar) else {
             return nil
         }
         let windowPrices = prices.filter {
@@ -119,7 +148,7 @@ struct StockPerformanceSnapshot: Hashable {
     }
 
     func gainPercent(period: StockLookback) -> Double? {
-        guard let targetDate = calendar.date(byAdding: period.offset, to: anchorDate),
+        guard let targetDate = period.startDate(before: anchorDate, calendar: calendar),
               let historicalPrice = prices.last(where: {
                   calendar.startOfDay(for: $0.date) <= targetDate
               })?.close else {
