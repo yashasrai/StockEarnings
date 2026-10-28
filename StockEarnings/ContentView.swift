@@ -9,6 +9,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var viewModel = EarningsViewModel()
+    @State private var refreshID = UUID()
     @State private var selectedPeriod: StockLookback = .oneMonth
 
     var body: some View {
@@ -22,17 +23,15 @@ struct ContentView: View {
             .padding()
             .navigationTitle("Stock Earnings")
         }
-        .task {
-            await viewModel.loadIfNeeded()
-        }
-        .task(id: viewModel.dateFrom) {
-            guard viewModel.hasFinishedInitialLoad else { return }
+        .task(id: EarningsRequest(from: viewModel.dateFrom, to: viewModel.dateTo, refreshID: refreshID)) {
             await viewModel.load()
         }
-        .task(id: viewModel.dateTo) {
-            guard viewModel.hasFinishedInitialLoad else { return }
-            await viewModel.load()
-        }
+    }
+
+    private struct EarningsRequest: Equatable {
+        let from: Date
+        let to: Date
+        let refreshID: UUID
     }
 
     private var controls: some View {
@@ -40,6 +39,12 @@ struct ContentView: View {
             HStack(spacing: 12) {
                 DatePicker("DateFrom", selection: $viewModel.dateFrom, displayedComponents: .date)
                 DatePicker("DateTo", selection: $viewModel.dateTo, displayedComponents: .date)
+                Button {
+                    refreshID = UUID()
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .disabled(viewModel.isLoading)
             }
 
             ScrollView(.horizontal, showsIndicators: false) {
@@ -56,7 +61,9 @@ struct ContentView: View {
 
     @ViewBuilder
     private var status: some View {
-        if let errorMessage = viewModel.errorMessage {
+        if viewModel.isLoading {
+            ProgressView("Loading earnings...")
+        } else if let errorMessage = viewModel.errorMessage {
             Text(errorMessage)
                 .foregroundStyle(.red)
         } else {
@@ -66,11 +73,16 @@ struct ContentView: View {
     }
 
     private var resultsTable: some View {
-        ScrollView([.horizontal, .vertical]) {
+        let dates = Set(viewModel.rows.map(\.reportDate)).sorted()
+        let dateColors = Dictionary(uniqueKeysWithValues: dates.enumerated().map { index, date in
+            (date, Color(hue: (Double(index) * 0.61803398875).truncatingRemainder(dividingBy: 1),
+                         saturation: 0.65, brightness: 0.85))
+        })
+        return ScrollView([.horizontal, .vertical]) {
             LazyVStack(alignment: .leading, spacing: 0) {
                 tableHeader
                 ForEach(viewModel.filteredRows) { row in
-                    tableRow(row)
+                    tableRow(row, dateColor: dateColors[row.reportDate] ?? .blue)
                     Divider()
                 }
             }
@@ -151,7 +163,7 @@ struct ContentView: View {
         .background(Color(uiColor: .systemGray5))
     }
 
-    private func tableRow(_ row: EarningsRow) -> some View {
+    private func tableRow(_ row: EarningsRow, dateColor: Color) -> some View {
         HStack(spacing: 0) {
             bodyCell(row.reportDate, width: 120)
             bodyCell(row.displayTimeOfTheDay, width: 120)
@@ -159,7 +171,17 @@ struct ContentView: View {
             bodyCell(row.name, width: 320)
         }
         .padding(.vertical, 10)
-        .background(row.id == viewModel.selectedRow?.id ? Color(uiColor: .systemGray5) : Color(uiColor: .secondarySystemBackground))
+        .background(dateColor.opacity(row.id == viewModel.selectedRow?.id ? 0.30 : 0.12))
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(dateColor)
+                .frame(width: 3)
+        }
+        .overlay {
+            if row.id == viewModel.selectedRow?.id {
+                Rectangle().strokeBorder(dateColor, lineWidth: 2)
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture {
             Task {

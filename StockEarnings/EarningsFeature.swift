@@ -45,6 +45,14 @@ struct EarningsRow: Identifiable, Hashable {
         Set(index.split(separator: ",").map(String.init))
     }
 
+    var marketSessionSortOrder: Int {
+        switch timeOfTheDay.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "bmo": return 0
+        case "amc": return 1
+        default: return 2
+        }
+    }
+
     var displayTimeOfTheDay: String {
         switch timeOfTheDay.lowercased() {
         case "bmo":
@@ -161,12 +169,15 @@ struct StockPerformanceSnapshot: Hashable {
 enum EarningsError: LocalizedError {
     case invalidResponse
     case rateLimited
+    case invalidDateRange
     case apiError(String)
 
     var errorDescription: String? {
         switch self {
         case .invalidResponse:
             return "Alpha Vantage returned an invalid response."
+        case .invalidDateRange:
+            return "DateFrom must be on or before DateTo."
         case .rateLimited:
             return "Alpha Vantage rate limit reached. Try again shortly."
         case .apiError(let message):
@@ -193,16 +204,36 @@ struct EarningsService {
     private let apiKey = "7LSXOMBJO0A4TCG9"
     private let session: URLSession
     private let calendar = Calendar(identifier: .gregorian)
+    private let cacheURL: URL
 
-    nonisolated init(session: URLSession = .shared) {
+    nonisolated init(session: URLSession = .shared, cacheURL: URL? = nil) {
         self.session = session
+        self.cacheURL = cacheURL ?? URL.applicationSupportDirectory
+            .appendingPathComponent("StockEarnings", isDirectory: true)
+            .appendingPathComponent("earnings-calendar.csv")
+    }
+
+    func cachedHistoricalEarnings(from startDate: Date, to endDate: Date) throws -> [EarningsRow] {
+        let today = isoDateFormatter.string(from: Date())
+        return filterRows(try readCache().filter { $0["reportDate", default: ""] < today },
+                          from: startDate, to: endDate)
     }
 
     func fetchEarnings(from startDate: Date, to endDate: Date) async throws -> [EarningsRow] {
+        guard normalizedDay(startDate) <= normalizedDay(endDate) else {
+            throw EarningsError.invalidDateRange
+        }
+        let today = normalizedDay(Date())
+        if normalizedDay(endDate) < today {
+            return try cachedHistoricalEarnings(from: startDate, to: endDate)
+        }
+        let horizon = [3, 6, 12].first { months in
+            endDate <= (calendar.date(byAdding: .month, value: months, to: today) ?? today)
+        } ?? 12
         var components = URLComponents(string: "https://www.alphavantage.co/query")
         components?.queryItems = [
             URLQueryItem(name: "function", value: "EARNINGS_CALENDAR"),
-            URLQueryItem(name: "horizon", value: "3month"),
+            URLQueryItem(name: "horizon", value: "\(horizon)month"),
             URLQueryItem(name: "apikey", value: apiKey),
         ]
 
@@ -210,7 +241,8 @@ struct EarningsService {
             throw EarningsError.invalidResponse
         }
 
-        let (data, response) = try await session.data(from: url)
+        let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+        let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse, 200..<300 ~= httpResponse.statusCode else {
             throw EarningsError.invalidResponse
         }
@@ -227,16 +259,66 @@ struct EarningsService {
             throw EarningsError.apiError("Alpha Vantage error: \(raw)")
         }
 
+        let dictionaries = try decodeCalendar(raw)
+        // Re-read after the network request so another completed fetch is preserved.
+        let cached = try readCache()
+        let todayString = isoDateFormatter.string(from: today)
+        let horizonEnd = isoDateFormatter.string(from:
+            calendar.date(byAdding: .month, value: horizon, to: today) ?? today)
+        // Replace the fetched window so rescheduled or removed events do not linger.
+        let retained = cached.filter {
+            let date = $0["reportDate", default: ""]
+            return date < todayString || date > horizonEnd
+        }
+        var merged: [String: [String: String]] = [:]
+        for row in retained + dictionaries {
+            let key = row["symbol", default: ""].uppercased() + "|" + row["reportDate", default: ""]
+            merged[key] = row
+        }
+        try writeCache(Array(merged.values))
+        let historical = cached.filter { $0["reportDate", default: ""] < todayString }
+        return filterRows(historical + dictionaries.filter {
+            $0["reportDate", default: ""] >= todayString
+        }, from: startDate, to: endDate)
+    }
+
+    private func readCache() throws -> [[String: String]] {
+        guard FileManager.default.fileExists(atPath: cacheURL.path) else { return [] }
+        return try decodeCalendar(String(contentsOf: cacheURL, encoding: .utf8))
+    }
+
+    private func decodeCalendar(_ raw: String) throws -> [[String: String]] {
         let csvRows = parseCSV(raw)
-        guard let header = csvRows.first else {
-            return []
+        guard let header = csvRows.first,
+              Set(header).count == header.count,
+              ["symbol", "name", "reportDate"].allSatisfy(header.contains) else {
+            throw EarningsError.invalidResponse
         }
-
-        let dictionaries = csvRows.dropFirst().map { row -> [String: String] in
-            Dictionary(uniqueKeysWithValues: zip(header, row))
+        return try csvRows.dropFirst().map { row in
+            guard row.count == header.count else { throw EarningsError.invalidResponse }
+            let values = Dictionary(uniqueKeysWithValues: zip(header, row))
+            guard !values["symbol", default: ""].isEmpty,
+                  isoDateFormatter.date(from: values["reportDate", default: ""]) != nil else {
+                throw EarningsError.invalidResponse
+            }
+            return values
         }
+    }
 
-        return filterRows(dictionaries, from: startDate, to: endDate)
+    private func writeCache(_ rows: [[String: String]]) throws {
+        let header = Set(rows.flatMap { $0.keys }).union(["symbol", "name", "reportDate"]).sorted()
+        func escape(_ value: String) -> String {
+            "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+        }
+        let sorted = rows.sorted {
+            ($0["reportDate", default: ""], $0["symbol", default: ""]) <
+            ($1["reportDate", default: ""], $1["symbol", default: ""])
+        }
+        let lines = [header] + sorted.map { row in header.map { row[$0, default: ""] } }
+        let csv = lines.map { $0.map(escape).joined(separator: ",") }.joined(separator: "\n") + "\n"
+        try FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try csv.write(to: cacheURL, atomically: true, encoding: .utf8)
     }
 
     private func filterRows(_ rows: [[String: String]], from startDate: Date, to endDate: Date) -> [EarningsRow] {
@@ -246,13 +328,12 @@ struct EarningsService {
             ("Russel2000", StockUniverse.russell2000),
             ("OCCNormalizedTop500", StockUniverse.occTop500),
         ]
-        let indexOrder = Dictionary(uniqueKeysWithValues: memberships.enumerated().map { ($1.0, $0) })
         let rejectSet = Set(["Russel2000"])
         let cutoff = 300
         let normalizedStartDate = normalizedDay(startDate)
-        let normalizedEndDate = normalizedDay(adjustedEndDate(start: startDate, end: endDate))
+        let normalizedEndDate = normalizedDay(endDate)
 
-        var filtered: [(row: EarningsRow, membershipCount: Int)] = []
+        var filtered: [EarningsRow] = []
 
         for sourceRow in rows {
             let symbol = sourceRow["symbol", default: ""].trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
@@ -281,96 +362,65 @@ struct EarningsService {
                 continue
             }
 
-            filtered.append((
-                row: EarningsRow(
+            filtered.append(
+                EarningsRow(
                     index: matchedMemberships.joined(separator: ","),
                     reportDate: reportDate,
                     symbol: sourceRow["symbol", default: ""],
                     name: sourceRow["name", default: ""],
                     estimate: sourceRow["estimate", default: ""],
                     timeOfTheDay: sourceRow["timeOfTheDay", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
-                ),
-                membershipCount: matchedMemberships.count
-            ))
+                )
+            )
         }
 
-        filtered.sort { lhs, rhs in
-            if lhs.membershipCount != rhs.membershipCount {
-                return lhs.membershipCount > rhs.membershipCount
+        return filtered.sorted { lhs, rhs in
+            if lhs.reportDate != rhs.reportDate {
+                return lhs.reportDate < rhs.reportDate
             }
-
-            let lhsFirstIndex = lhs.row.index.split(separator: ",").first.map(String.init) ?? ""
-            let rhsFirstIndex = rhs.row.index.split(separator: ",").first.map(String.init) ?? ""
-            let lhsOrder = indexOrder[lhsFirstIndex] ?? .max
-            let rhsOrder = indexOrder[rhsFirstIndex] ?? .max
-
-            if lhsOrder != rhsOrder {
-                return lhsOrder < rhsOrder
+            if lhs.marketSessionSortOrder != rhs.marketSessionSortOrder {
+                return lhs.marketSessionSortOrder < rhs.marketSessionSortOrder
             }
-
-            if lhs.row.reportDate != rhs.row.reportDate {
-                return lhs.row.reportDate < rhs.row.reportDate
-            }
-
-            return lhs.row.symbol < rhs.row.symbol
+            return lhs.symbol < rhs.symbol
         }
-
-        return filtered.map(\.row)
     }
 
     private func parseCSV(_ csv: String) -> [[String]] {
-        csv
-            .split(whereSeparator: \.isNewline)
-            .map(String.init)
-            .map(parseCSVLine)
-    }
-
-    private func parseCSVLine(_ line: String) -> [String] {
+        var rows: [[String]] = []
         var values: [String] = []
         var current = ""
         var insideQuotes = false
-        var index = line.startIndex
-
-        while index < line.endIndex {
-            let character = line[index]
+        var index = csv.startIndex
+        while index < csv.endIndex {
+            let character = csv[index]
             if character == "\"" {
-                let nextIndex = line.index(after: index)
-                if insideQuotes, nextIndex < line.endIndex, line[nextIndex] == "\"" {
+                let nextIndex = csv.index(after: index)
+                if insideQuotes, nextIndex < csv.endIndex, csv[nextIndex] == "\"" {
                     current.append("\"")
-                    index = line.index(after: nextIndex)
+                    index = csv.index(after: nextIndex)
                     continue
                 }
                 insideQuotes.toggle()
             } else if character == ",", !insideQuotes {
                 values.append(current)
                 current = ""
+            } else if character.isNewline, !insideQuotes {
+                if !values.isEmpty || !current.isEmpty {
+                    rows.append(values + [current])
+                }
+                values = []
+                current = ""
             } else {
                 current.append(character)
             }
-            index = line.index(after: index)
+            index = csv.index(after: index)
         }
-
-        values.append(current)
-        return values
+        if !values.isEmpty || !current.isEmpty { rows.append(values + [current]) }
+        return rows
     }
 
     private func normalizedDay(_ date: Date) -> Date {
         calendar.startOfDay(for: date)
-    }
-
-    private func adjustedEndDate(start: Date, end: Date) -> Date {
-        let startComponents = calendar.dateComponents([.month, .day], from: start)
-        let endComponents = calendar.dateComponents([.month, .day], from: end)
-        guard let startMonth = startComponents.month, let startDay = startComponents.day,
-              let endMonth = endComponents.month, let endDay = endComponents.day else {
-            return end
-        }
-
-        if (endMonth, endDay) < (startMonth, startDay) {
-            return calendar.date(byAdding: .year, value: 1, to: end) ?? end
-        }
-
-        return end
     }
 
     private var isoDateFormatter: DateFormatter {
@@ -481,8 +531,7 @@ final class EarningsViewModel: ObservableObject {
 
     private let service: EarningsService
     private let priceService: StockPriceService
-    private var hasLoaded = false
-    var hasFinishedInitialLoad: Bool { hasLoaded }
+    private var activeRequestID: UUID?
 
     init(
         service: EarningsService = EarningsService(),
@@ -496,27 +545,36 @@ final class EarningsViewModel: ObservableObject {
         self.dateTo = Self.currentWeekSaturday(from: today, calendar: calendar) ?? today
     }
 
-    func loadIfNeeded() async {
-        guard !hasLoaded else { return }
-        hasLoaded = true
-        await load()
-    }
-
     func load() async {
+        let requestID = UUID()
+        activeRequestID = requestID
+        let startDate = dateFrom
+        let endDate = dateTo
         isLoading = true
         errorMessage = nil
+        rows = []
+
+        defer {
+            if activeRequestID == requestID {
+                isLoading = false
+            }
+        }
 
         do {
-            rows = try await service.fetchEarnings(from: dateFrom, to: dateTo)
+            rows = try service.cachedHistoricalEarnings(from: startDate, to: endDate)
+            let fetchedRows = try await service.fetchEarnings(from: startDate, to: endDate)
+            guard !Task.isCancelled, activeRequestID == requestID,
+                  dateFrom == startDate, dateTo == endDate else { return }
+            rows = fetchedRows
             if let selectedSymbol = selectedRow?.symbol {
                 selectedRow = rows.first(where: { $0.symbol == selectedSymbol })
             }
         } catch {
-            rows = []
+            guard !Task.isCancelled, activeRequestID == requestID,
+                  dateFrom == startDate, dateTo == endDate else { return }
+            selectedRow = nil
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
-
-        isLoading = false
     }
 
     func toggle(_ group: MembershipGroup) {
